@@ -1,0 +1,807 @@
+---
+title: 'Homework 2: LDA'
+author: "Anna Tedikova, Anastasia Zhitkova, Anastasia Yanechko"
+date: "2022-11-27"
+output:
+  html_document:
+    css: style.css
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+# Preparations
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(tidytext)
+library(dplyr)
+library(stopwords)
+library(textstem)
+library(stringr)
+library(knitr)
+library(udpipe)
+library(tidyr)
+library(rJava)
+library(mallet)
+library(LDAvis)
+library(servr)
+library(ggplot2)
+library(tibble)
+```
+
+## Loading the data
+
+```{r data, warning=FALSE, show_col_types = FALSE, message=FALSE}
+data <- read_csv("C:/Users/Anna/Desktop/res1.csv")
+head(data, 10)
+```
+
+# Data Preparation
+
+
+Texts we use in our homework are the song lyrics of rock and pop female singers. Lyrics were retrieved from Genius website, using API. Our data contains columns featuring the genre (rock or pop), name of the artist, name of the songs and lines from them. 
+
+As for the rock female singers, we have chosen:
+1. Avril Lavigne
+2. Blondie
+3. Evanescence
+4. Paramore
+5. Royal & the Serpent
+6. The Pretty Reckless
+
+As for the pop female singers, we have chosen:
+1. Britney Spears
+2. Katy Perry
+3. Lady Gaga
+4. Madonna
+5. Rihanna
+
+Artists were chosen from the most popular ones according to last.fm website.
+
+
+## Lemmatization
+
+```{r}
+data_clean <-  data %>% select(song_name, artist_name, genre, line) %>% mutate(X = row_number())
+
+enstopwords <- tibble(word = stopwords("en"))
+data_clean <- unnest_tokens(data_clean, word, line, token = "words")
+
+data_lemmas <- data_clean %>%
+    mutate(lem = lemmatize_words(word)) %>%
+    filter(! lem %in% stopwords("en")) %>%
+    filter(! str_detect(lem, "[0-9]+")) %>%
+    filter(! str_detect(lem, "[[:punct:]]"))
+
+head(data_lemmas, 10)
+```
+
+## Corpus statistics
+
+We will look at basic statistics of the corpus, such as corpus size, vocabulary size, class distribution.
+
+First, we need to create a frequency list of our lemmas.
+
+### Frequency list
+```{r, warning=FALSE}
+freqlist <- data_lemmas %>% count(word, sort=TRUE)
+head(freqlist)
+```
+We see that the most frequent words are "oh", "love", "like", which may lead to a hypothesis that one of the popular topics in songs we have chosen is love. 
+
+### Corpus size: 
+
+```{r, warning=FALSE}
+sum(freqlist$n)
+```
+Our corpus size is 345055.
+
+### Vocabulary size: 
+
+```{r, warning=FALSE}
+nrow(freqlist)
+```
+Our vocabulary size is 13280.
+
+### Further preparation of data
+
+```{r, warning=FALSE}
+head(table(data_lemmas$song_name))
+```
+
+```{r}
+data_1 <- data_lemmas %>% 
+  select(X,lem) %>%
+  group_by(X) %>% 
+  summarize(text = paste(lem, collapse = ' '))
+
+data_cleanest <- merge(x = data_1, y = data, by = "X", all.x = TRUE)
+
+data_cleanest <- data_cleanest %>% select(X, text, song_name, artist_name, line, genre)
+
+data_new <- data_cleanest %>% na.omit()
+```
+
+### Class distribution
+
+We make a table with counts of lemmas according to genre. We can see that rock corpus is smaller that pop corpus. 
+
+```{r, warning=FALSE}
+kable(table(data_lemmas$genre),
+      col.names = c("Genre", "Freq"))
+```
+
+## Contrastive analysis
+
+```{r}
+data_rock <- data_lemmas %>%
+  filter(genre %in% 'Rock')
+
+data_pop <- data_lemmas %>%
+  filter(genre %in% 'Pop')
+```
+
+The most frequent words in rock songs:
+
+```{r}
+rock_freqlist <- data_rock %>% count(lem, sort=TRUE)
+head(rock_freqlist)
+```
+
+The most frequent words in pop songs:
+
+```{r}
+pop_freqlist <- data_pop %>% count(lem, sort=TRUE)
+head(pop_freqlist)
+```
+We can see that the most frequent words are almost the same among rock and pop genres. 
+
+To make data for comparisons, we now create lemma frequency lists for
+both corpora and join them in a single table.
+Filter out rare words (n<10 for both genres).
+
+
+```{r}
+genres.lemmas <- bind_rows(data_pop, data_rock) %>%
+    dplyr::count(lem, genre) %>%
+    spread(genre, n, fill = 0) %>%
+    dplyr::filter(Pop > 10 | Rock > 10)
+head(genres.lemmas)
+```
+
+We have a list of words and the number of times they appeared both in pop and rock songs. Now what?
+
+### Normalized frequency
+
+Now that we compare frequency lists. It is useful to represent counts on a normalized scale. A conventional unit for word frequencies in
+corpus linguistics is IPM (Instances Per Million).
+
+
+```{r}
+# the number of all words (lemmas) in rock songs
+rock_num = sum(genres.lemmas$Rock)
+# in republicans
+pop_num = sum(genres.lemmas$Pop)
+genres.ipms <- genres.lemmas
+genres.ipms$Rock <- genres.ipms $ Rock * ( 10e+6 / rock_num )
+genres.ipms$Pop <- genres.ipms $ Pop * ( 10e+6 / pop_num )
+head(genres.ipms)
+```
+
+We can also look at the top-N words for both genres we observe in this project.
+
+```{r}
+# for rock songs
+genres.ipms %>% arrange(desc(Rock)) 
+```
+
+```{r}
+# for pop songs
+genres.ipms %>% arrange(desc(Pop)) 
+```
+
+Both lists are very similar. The most frequent words are the same; some of them are placed in different parts of the top, but they are here. The words aren't very telling in terms of helping to detect the genre of the song they are from: it seems like both in pop and rock songs people like going "oh baby", "yes baby", "just love".
+
+### Dunning log-likelihood (G^2)
+
+The most commonly used statistical measure to evaluate the the difference of a word's frequency in two corpora is called log-likelihood (G-squared). 
+
+We start with defining a function that will calculate a list of G2
+values given two columns of frequencies (in corpora Rock and Pop).
+
+
+```{r}
+#i put a correct version of the function here
+g2 = function(a, b){
+  c = sum(a) - a
+  d = sum(b) - b
+  a.exp = ((a+b)*(a+c))/(a+b+c+d)
+  b.exp = ((a+b)*(b+d))/(a+b+c+d)
+  c.exp = ((c+d)*(a+c))/(a+b+c+d)
+  d.exp = ((c+d)*(b+d))/(a+b+c+d)
+  G2 = 2*(a*log(a/a.exp+1e-7) + b*log(b/b.exp+1e-7) + c*log(c/c.exp+1e-7) + d*log(d/d.exp+1e-7))
+}
+```
+
+Now we can calculate log-likelihood for lemma frequency
+differences for each genre:
+
+```{r}
+genres.g2 <- genres.lemmas %>% 
+    mutate(g2=g2(Pop, Rock)) %>%
+    arrange(desc(g2)) %>%
+    mutate(g2 = round(g2, 2))
+genres.g2
+```
+   
+Some new interesting words appear in the list.
+
+
+### Effect size. Log Ratio
+
+So we are going to supplement our log-likelihood tests with an effect
+size measure that allow to quantify, how large exactly is the difference
+of frequencies.
+
+
+Here we define a function similar to g2, and apply it to our data. 
+
+```{r}
+logratio <- function(a, b) {
+    return(log2((a/sum(a)/(b/sum(b)))))
+}
+```
+
+Now we may add odds to our table.
+
+```{r}
+genres.lr <- genres.g2 %>%
+    mutate(logodds = logratio(Pop, Rock))
+```
+
+Words used evenly by songwriters in both genres:
+
+```{r}
+genres.lr %>%
+    arrange(abs(logodds))
+```
+
+Words most acutely overused by one or the other party:
+
+```{r}
+genres.disproportion <- genres.lr %>%
+    dplyr::filter(Pop > 0 & Rock > 0) %>%
+    group_by(logodds < 0) %>%
+    top_n(15, abs(logodds)) %>%
+    ungroup()
+head(genres.disproportion)
+```
+
+The same result in a nice looking plot.
+
+```{r}
+genres.lr %>%
+    filter(Pop > 0 & Rock > 0) %>%
+    group_by(logodds < 0) %>%
+    top_n(15, abs(logodds)) %>%
+    ungroup() %>%
+    mutate(lem = reorder(lem, logodds)) %>%
+    ggplot(aes(lem, logodds, fill = logodds > 0)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    ylab("log odds ratio (Rock/Pop)") +
+    scale_fill_discrete(name = "", labels = c("Rock", "Pop"))
+```
+
+Now we can see a difference between words frequently used by genres. Rock songs seem to be bolder and address more violent themes more often ("warrior", "union", "shotgun"), whereas pop songs seem to be more gentle in choice of words ("Christmas", "groove", "mum", "rescue").
+
+## Contrastive analysis with bigrams
+
+### Tokenizing to bigrams
+
+```{r}
+data_clean1 <-  data %>% select(song_name, artist_name, genre, line) %>% mutate(X = row_number())
+enstopwords <- tibble(word = stopwords("en"))
+data_clean1 <- unnest_tokens(data_clean1, word, line, token = "ngrams", n = 2)
+```
+
+### Separating to separate columns
+
+```{r}
+data_clean1 <- data_clean1 %>% separate(word, c("word1", "word2"), sep = " ")
+```
+
+### Lemmatization + dropping stopwords + dropping tokens with the digits
+
+```{r}
+data_clean1 <- data_clean1 %>%
+  mutate(lem1 = lemmatize_words(word1), lem2 = lemmatize_words(word2)) %>%
+  filter(!lem1 %in% stopwords("en") & !lem2 %in% stopwords("en")) %>%
+  filter(!str_detect(lem1, "[0-9]+") & !str_detect(lem2, "[0-9]+"))
+```
+
+### Frequency list
+
+```{r}
+data_clean1 %>% dplyr:: count(lem1, lem2, sort=TRUE)
+```
+
+We see that the most frequent combinations are repeated exclamations.
+
+### Concatenate two words into one column
+
+```{r}
+bigrams <- data_clean1 %>%
+  mutate(word = paste(lem1, lem2, sep=" "))
+bigrams %>% dplyr:: count(word, sort=TRUE)
+```
+Now let's repeat what we have done to separate words, but this time we will experiment with bigrams as we hope for more informative results in this case. 
+
+```{r}
+bigrams_rock <- bigrams %>%
+  filter(genre %in% 'Rock')
+
+bigrams_pop <- bigrams %>%
+  filter(genre %in% 'Pop')
+```
+
+The most frequent bigrams in rock songs:
+
+```{r}
+b_rock_freqlist <- bigrams_rock %>% count(word, sort=TRUE)
+head(b_rock_freqlist)
+```
+
+The most frequent bigrams in pop songs:
+
+```{r}
+b_pop_freqlist <- bigrams_pop %>% count(word, sort=TRUE)
+head(b_pop_freqlist)
+```
+We can see that the most frequent bigrams are almost the same among rock and pop genres, and those are pretty meaningless exclamations.  
+
+To make data for comparisons, we now create lemma frequency lists for
+both corpora and join them in a single table.
+Filter out rare words (n<10 for both genres).
+
+```{r}
+big_genres.lemmas <- bind_rows(bigrams_pop, bigrams_rock) %>%
+    dplyr::count(word, genre) %>%
+    spread(genre, n, fill = 0) %>%
+    dplyr::filter(Pop > 10 | Rock > 10)
+head(big_genres.lemmas)
+```
+We have a list of bigrams and the number of times they appeared both in pop and rock songs.
+
+### Normalized frequency
+
+We will represent counts on a normalized scale. 
+
+```{r}
+# the number of all bigrams in rock songs
+big_rock_num = sum(big_genres.lemmas$Rock)
+# the number of all bigrams in pop songs
+big_pop_num = sum(big_genres.lemmas$Pop)
+big_genres.ipms <- big_genres.lemmas
+big_genres.ipms$Rock <- big_genres.ipms $ Rock * ( 10e+6 / big_rock_num )
+big_genres.ipms$Pop <- big_genres.ipms $ Pop * ( 10e+6 / big_pop_num )
+head(big_genres.ipms)
+```
+
+We can also look at the top-N bigrams for both genres we observe in this project.
+
+```{r}
+# for rock songs
+big_genres.ipms %>% arrange(desc(Rock)) 
+```
+
+```{r}
+# for pop songs
+big_genres.ipms %>% arrange(desc(Pop)) 
+```
+
+Both lists are very similar. The most frequent words are the same; some of them are placed in different parts of the top, but they are here. We suppose that such combinations are often used in choruses of both rock and pop songs, therefore lists are similar. 
+
+### Dunning log-likelihood (G^2)
+
+The most commonly used statistical measure to evaluate the the difference of a word's frequency in two corpora is called log-likelihood (G-squared). 
+
+We start with defining a function that will calculate a list of G2
+values given two columns of frequencies (in corpora Rock and Pop).
+
+```{r}
+g2 = function(a, b){
+  c = sum(a) - a
+  d = sum(b) - b
+  a.exp = ((a+b)*(a+c))/(a+b+c+d)
+  b.exp = ((a+b)*(b+d))/(a+b+c+d)
+  c.exp = ((c+d)*(a+c))/(a+b+c+d)
+  d.exp = ((c+d)*(b+d))/(a+b+c+d)
+  G2 = 2*(a*log(a/a.exp+1e-7) + b*log(b/b.exp+1e-7) + c*log(c/c.exp+1e-7) + d*log(d/d.exp+1e-7))
+}
+```
+
+Now we can calculate log-likelihood for lemma frequency
+differences for each genre:
+
+```{r}
+big_genres.g2 <- big_genres.lemmas %>% 
+    mutate(g2=g2(Pop, Rock)) %>%
+    arrange(desc(g2)) %>%
+    mutate(g2 = round(g2, 2))
+big_genres.g2
+```
+
+In the list above we get not one, but two meaningful combinations: "oh baby" and "real world".
+
+### Effect size. Log Ratio
+
+```{r}
+logratio <- function(a, b) {
+    return(log2((a/sum(a)/(b/sum(b)))))
+}
+```
+
+Now we may add odds to our table.
+
+```{r}
+big_genres.lr <- big_genres.g2 %>%
+    mutate(logodds = logratio(Pop, Rock))
+```
+
+Bigrams used evenly by songwriters in both genres: 
+
+```{r}
+big_genres.lr %>%
+    arrange(abs(logodds))
+```
+
+Finally we get combinations which so not look like sounds. It seems that songwriters both in rock and pop are evenly concerned about listeners "feeling good" and having somebody to talk to ("wanna talk").
+
+Bigrams most acutely overused by one or the other genre:
+
+```{r}
+big_genres.disproportion <- big_genres.lr %>%
+    dplyr::filter(Pop > 0 & Rock > 0) %>%
+    group_by(logodds < 0) %>%
+    top_n(15, abs(logodds)) %>%
+    ungroup()
+head(big_genres.disproportion)
+```
+
+The same result in a nice looking plot.
+
+```{r}
+big_genres.lr %>%
+    filter(Pop > 0 & Rock > 0) %>%
+    group_by(logodds < 0) %>%
+    top_n(15, abs(logodds)) %>%
+    ungroup() %>%
+    mutate(word = reorder(word, logodds)) %>%
+    ggplot(aes(word, logodds, fill = logodds > 0)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    ylab("log odds ratio (Rock/Pop)") +
+    scale_fill_discrete(name = "", labels = c("Rock", "Pop"))
+```
+
+Now it seems that we have meaningful lists. 
+As for pop songs, we see that lyrics mostly foucs on dancing ("bum bum", "wanna dance", "bright light"), attracting attention ("everybody come", "can look", "big deal") and escapism ("hopeless place", "can forget", "go crazy").
+As for rock songs, we see that the lyrics focus on unwell mental state ("break inside", "nobody's fool", "hard time"). Other bigrams do not give a clear idea about what they focus on; unlike in case of pop songs, there are repetitive words in a few cases ("ow ow", "full full").
+
+
+
+## POS-tagging
+
+```{r, warning=FALSE}
+model_loaded <- udpipe::udpipe_download_model(language = "english-ewt")
+filename = model_loaded$file_model
+```
+
+```{r}
+model <- udpipe_load_model(file = filename)
+```
+
+Further we select only lemmas for words that have POS-tags "ADJ", "NOUN" as they are the most meaningful. We will also merge selected lemmas into original documents. 
+
+```{r}
+text_anndf <- udpipe::udpipe_annotate(model, x =  data_new$text, doc_id = data_new$X, tagger = "default", parser = "none") %>%
+  as.data.frame()
+text_anndf <- text_anndf %>% select(doc_id, lemma, upos)
+data_imtired <- text_anndf %>% 
+  filter(upos %in% c("ADJ", "NOUN")) %>%
+  select(-upos) %>%
+  group_by(doc_id) %>% 
+  summarize(text = paste(lemma, collapse = ' '))
+names(data)[2] <- 'doc_id'
+data_final <- merge(x = data_imtired, y = data, by = "doc_id", all.x = TRUE)
+data_final <- data_final %>% select(-...1)
+head(data_final,1)
+```
+
+# Building LDA model
+
+## LDA: training a model
+
+Before proceeding, we will limit Java to use not more than 1G of RAM. 
+
+```{r}
+options(java.parameters = "-Xmx1g")
+```
+
+To begin with, we will process documents texts to tokenize texts
+and to collect usage statistics.
+
+
+```{r}
+mallet.instances <- mallet.import(id.array=as.character(data_final$doc_id),
+                                  text.array=data_final$text,
+                                  stoplist="stopwords.txt")
+```
+
+Now we set the parameters for the desired model, and load the data
+prepared in the previous step. 
+
+```{r}
+topic.model <- MalletLDA(num.topics=10) 
+topic.model$setRandomSeed(42L)
+topic.model$loadDocuments(mallet.instances) 
+topic.model$setAlphaOptimization(20, 50)
+```
+
+Next we collect some statistics about the dictionary and frequency of
+tokens for later use.
+
+```{r}
+vocabulary <- topic.model$getVocabulary()
+word.freqs <- mallet.word.freqs(topic.model) 
+```
+
+We can also look at the top of the frequent words (by doc frequency).
+
+```{r}
+word.freqs %>% arrange(desc(doc.freq)) %>% head(10)
+```
+It seems that this list is very similar to the frequency list we have obtained in the beginning.
+
+## LDA: training a model
+
+```{r}
+topic.model$train(500)
+```
+
+Now we select the best topic for each token in 10 iterations.
+
+```{r}
+topic.model$maximize(10)
+```
+
+## LDA: results
+
+### Doc-topics table
+
+```{r}
+doc.topics <- mallet.doc.topics(topic.model, smoothed=TRUE, normalized=TRUE)
+head(doc.topics, 1)
+```
+
+### Word-topics table
+
+```{r}
+topic.words <- mallet.topic.words(topic.model, smoothed=TRUE, normalized=TRUE)
+```
+
+### Topic labels: 10 top-words
+
+```{r}
+topic.labels <- mallet.topic.labels(topic.model, topic.words, 10)
+topic.labels
+```
+1. Love, falling in love
+2. Having good time, living life
+3.Heartbreaks
+4. American dream
+5. Parting with a loved one
+6. Night life, clubbing
+7. Hot crazy boy and girl
+8. Dance floor
+9. General
+10. Criminal and elite lifestyle
+
+## Results Analysis: a Common Way
+
+Now we will inspect the top-30 words for each topic and guess what they are about.
+
+1. Love, falling in love
+2. Having good time, living life
+3. Heartbreaks
+4. American dream
+5. Parting with a loved one
+6. Night life, clubbing
+7. Hot crazy boy and girl
+8. Dance floor
+9. General
+10. Criminal and elite lifestyle
+
+```{r}
+for (k in 1:nrow(topic.words)) {
+    top <- paste(mallet.top.words(topic.model, topic.words[k,], 30)$term,collapse=" ")
+    cat(paste(k, top, "\n"))
+}
+```
+We will inspect the first few documents with a given topic weight more than
+5%. Below we define a function that does that for us.
+
+```{r}
+top.docs <- function(doc.topics, topic, docs, top.n=10) {
+    head(docs[order(-doc.topics[,topic])], top.n)
+}
+```
+
+### Top-documents for the first topic
+
+```{r}
+head(top.docs(doc.topics, 1, data_final$text),3)
+```
+
+We can also look at original texts. Below we can see 1 top-document for the first topic.
+
+```{r}
+top.docs(doc.topics, 1, data_final$line,top.n=1)
+```
+
+## Visualizing topic similarity (hierarchical clustering) of topics
+
+### Similarity by topics co-ocurrence in documents.
+
+```{r}
+plot(mallet.topic.hclust(doc.topics, topic.words, 0), labels=topic.labels)
+```
+
+### Similarity by the set of words in the topics
+
+```{r}
+plot(mallet.topic.hclust(doc.topics, topic.words, 1), labels=topic.labels)
+```
+
+### Balanced similarity by words and documents
+
+```{r}
+plot(mallet.topic.hclust(doc.topics, topic.words, 0.5), labels=topic.labels)
+```
+
+## LDA: Interactive Visualization
+
+At first we will count words.
+
+```{r}
+doc.length <- str_count(data_final$text, boundary("word"))
+doc.length[doc.length==0] <- 0.000001 
+```
+
+### Visualization setup
+
+```{r}
+json <- createJSON(phi = topic.words, theta=doc.topics, doc.length=doc.length, vocab=vocabulary, term.frequency=word.freqs$word.freq)
+```
+
+### Launch interactive interface
+
+```{r eval=FALSE}
+serVis(json, out.dir="lda50", open.browser=TRUE)
+```
+
+# Interpretation
+
+
+
+
+
+Topic 24: the most popular words here are body, hot, sweet, deep, little, get. Short name for this topic is "intimacy": an act of knowing another person deeply both physically and mentally, getting a glimpse of their soul in every little mundane action.
+
+Topic 25: the most popular words here are do, day, track, feat, record, monster, eat. Short name for this topic is "bodybuilding": eating, tracking progess day-by-day, becoming a better version of yourself. 
+
+Topic 26: the most popular words here are bitch, work, good, ah, beep, go. Short name for this topic is "capitalism": good work makes you feel good. Beep. 
+
+Topic 27: the most popular words here are give, stupid, reason, stop, fever. Short name for this topic is "sickness": whether literally or metaphorically, when you feel ill, you want to understand the cause of it; but more than anything you want it to end.   
+
+Topic 28: the most popular words here are beautiful, dirty, girlfriend, vogue, live, fame, rich, full. Short name for this topic is "elite": money, fame, relationship - a life full with everything people ususally desire; whether it's something beautiful or dirty is up to you to decide. 
+
+Topic 29: the most popular words here are perform, big, ring, bass, bell, express. Short name for this topic is "hit": feelings expressed on the stage through songs and music resonate with the audience. Audience can be grateful towards those who make it feel understood and seen: you will find yourself in top of charts soon. 
+
+Topic 30: the most popular words here are skin, unconscious, scoop, travel, heavy. Short name for this topic is "true crime". The list of words makes us feel uneasy, aware of the dark part of womanhood - constant danger of being targeted by men who see you as an object. 
+
+Generally we can say that a lot of topics are dedicated to themes connected with romantic relationships with people. However, there are also topics focused on such aspects of life as being sociable, parting, causing changes, achieving something. 
+
+
+# Additionally for the project
+
+We want to see which topics are more likely to appear in different genres. 
+
+```{r}
+doc.topics.bin <- ifelse(doc.topics > 0.05, 1, 0)
+
+data_clean_topics <- cbind(data_final, doc.topics.bin)
+head(data_clean_topics)
+
+#delete some unnecessary topics
+topics_genre <- data_clean_topics %>% 
+  select(-song_name,-artist_name,-text, -line, -doc_id) %>%
+  group_by(genre) %>%
+   summarise(across(everything(), sum))
+
+head(topics_genre)
+
+table(data_final$genre)
+
+topics_pop <- topics_genre %>% filter(genre == "Pop")
+topics_pop <- topics_pop[2:11]/1355
+
+tpt <- t(topics_pop)
+tpt <- data.frame(tpt)
+tpt <- tibble::rownames_to_column(tpt, "topic")
+
+tpt %>% arrange(desc(tpt))
+
+barplot(tpt$tpt)
+```
+
+The most relevant ones are love, heartbreaks, joyful life and sex
+
+```{r}
+
+topics_rock <- topics_genre %>% filter(genre == "Rock")
+topics_rock <- topics_rock[2:11]/807
+
+trt <- t(topics_rock)
+trt <- data.frame(trt)
+trt <- tibble::rownames_to_column(trt, "topic")
+
+trt %>% arrange(desc(trt))
+
+barplot(trt$trt)
+```
+Not very different results for rock music, same topics but in slightly different order. However, the topic of breaking up is higher than for pop music. 
+
+plot
+1. Love, falling in love
+2. Having good time, living life
+3. Heartbreaks
+4. American dream
+5. Parting with a loved one
+6. Night life, clubbing
+7. Hot crazy boy and girl
+8. Dance floor
+9. General
+10. Criminal and elite lifestyle
+```{r}
+
+doc.top <- as.data.frame(doc.topics)
+
+doc.top <- rename(doc.top, Love = V1, 
+       Life = V2, Heartbreak = V3, 
+       American_dream = V4,
+       Break_up = V5,
+       Clubbing = V6,
+       Sex = V7,
+       Dancing = V8,
+       General = V9,
+       Elite = V10)
+
+transussy <- t(doc.top)
+transussy <- as.data.frame(transussy)
+transussy <- tibble::rownames_to_column(transussy, "topic")
+
+transussy <- transussy %>% 
+  group_by(topic) %>%
+  mutate(sum = sum(transussy[V1:V2160])) 
+
+transussy$sum
+
+f <- rowSums(transussy[ , c(2,2160)], na.rm=TRUE)
+
+barplot(f)
+```
+
